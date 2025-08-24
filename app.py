@@ -180,10 +180,10 @@ if not india_cities.empty:
 else:
     st.warning("CSV file not loaded. Ensure 'india_cities.csv' is in the app directory.")
 
-# Slider for cost impact (0 = no impact, 1 = high impact, prefers low cost)
-cost_impact = st.slider("Cost Impact on Location Selection (higher = prefer lower cost areas)", 0.0, 1.0, 0.5)
+# Slider for cost impact (0 = no impact, 1 = maximum impact, strongly prefers low cost)
+cost_impact = st.slider("Cost Impact on Location Selection (higher = strongly prefer lower cost areas)", 0.0, 1.0, 0.5)
 
-# Function to calculate weighted geographic centroid with cost adjustment
+# Function to calculate weighted geographic centroid with amplified cost adjustment
 def weighted_geographic_centroid(customers_df, cost_impact):
     if customers_df.empty:
         return None, None
@@ -198,8 +198,11 @@ def weighted_geographic_centroid(customers_df, cost_impact):
 
     for _, row in customers_df.iterrows():
         city_cost = get_city_cost(row['city'])
-        # Adjust weight: higher impact makes low cost increase weight
-        cost_factor = 1 - cost_impact * ((city_cost - min_cost) / (max_cost - min_cost + 1e-6))  # 1 for low cost, lower for high cost
+        # Normalized cost (0 = lowest, 1 = highest)
+        normalized_cost = (city_cost - min_cost) / (max_cost - min_cost + 1e-6)
+        # Amplified cost factor: exponentially penalize high costs when impact is high
+        # When cost_impact=1, low cost gets full weight, high cost gets near 0
+        cost_factor = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Exponent amplifies impact (up to ~5x)
         weight = row['customers'] * cost_factor
 
         lat_rad = math.radians(row['lat'])
@@ -249,7 +252,7 @@ if sites_input.strip():
             else:
                 st.error(f"Invalid format in: {line}")
 
-# Scoring function for sites: combined distance + cost
+# Scoring function for sites: combined distance + amplified cost
 def compute_site_score(site_lat, site_lon, customers_df, cost_impact):
     if customers_df.empty:
         return 0.0
@@ -264,23 +267,25 @@ def compute_site_score(site_lat, site_lon, customers_df, cost_impact):
     weighted_avg_dist = np.average(dists, weights=weights)
     distance_score = 1 / (1 + weighted_avg_dist / 1000)  # Higher better (closer)
 
-    # Cost score: average cost of nearest cities or something? Wait, sites don't have inherent cost; perhaps estimate based on nearest city cost
-    # For simplicity, calculate average cost weighted by inverse distance to customer cities
+    # Cost score: average cost weighted by inverse distance, amplified
     costs = []
     cost_weights = []
+    max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
+    min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
     for _, row in customers_df.iterrows():
         dist = geodesic((site_lat, site_lon), (row['lat'], row['lng'])).km + 1e-6  # Avoid division by zero
         city_cost = get_city_cost(row['city'])
         costs.append(city_cost)
         cost_weights.append(row['customers'] / dist)  # Weight by customers and proximity
-    weighted_avg_cost = np.average(costs, weights=cost_weights)
     
-    # Normalize cost score (lower cost better)
-    max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
-    min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
-    cost_score = 1 - (weighted_avg_cost - min_cost) / (max_cost - min_cost + 1e-6)
+    weighted_avg_cost = np.average(costs, weights=cost_weights)
+    # Normalized cost (0 = low, 1 = high)
+    normalized_cost = (weighted_avg_cost - min_cost) / (max_cost - min_cost + 1e-6)
+    # Amplified cost score: exponentially favor low costs
+    cost_score = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Exponent amplifies (up to ~5x)
 
-    # Combined score
+    # Combined score (normalize cost_score to prevent over-domination)
+    cost_score = min(max(cost_score, 0), 1)  # Clamp to [0,1]
     final_score = distance_score * (1 - cost_impact) + cost_score * cost_impact
     return final_score
 
