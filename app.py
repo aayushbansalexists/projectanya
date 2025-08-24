@@ -53,13 +53,13 @@ def update_customer_from_parsed(city, customers):
     else:
         st.warning(f"City '{city}' not found in the dataset.")
 
-# Check query params for updates from WebGPU
+# Check query params for AI updates
 query_params = st.query_params.to_dict()
 if 'city' in query_params and 'customers' in query_params:
     city = query_params['city'][0]
     customers = int(query_params['customers'][0])
     update_customer_from_parsed(city, customers)
-    # Clear the query params to avoid re-adding on refresh
+    # Clear the query params to avoid re-adding
     st.query_params.clear()
     st.rerun()  # Rerun to refresh the display
 
@@ -72,12 +72,14 @@ if not india_cities.empty:
         <input id="user-query" type="text" placeholder="Tell me about your customers (e.g., 'I have 20000 customers in Mumbai')" style="width: 100%; padding: 10px; margin-bottom: 10px;">
         <button id="process-query" style="padding: 10px; background-color: #4CAF50; color: white; border: none; cursor: pointer;">Process Query with WebGPU</button>
         <div id="status" style="margin-top: 10px;"></div>
+        <div id="add-link-container" style="margin-top: 10px;"></div>
     </div>
     <script type="text/javascript">
         (async () => {
             const userQueryInput = document.getElementById('user-query');
             const processButton = document.getElementById('process-query');
             const statusDiv = document.getElementById('status');
+            const addLinkContainer = document.getElementById('add-link-container');
 
             // Check for WebGPU support
             if (!navigator.gpu) {
@@ -102,6 +104,7 @@ if not india_cities.empty:
                     if (!query) return;
 
                     statusDiv.innerHTML = 'Processing query...';
+                    addLinkContainer.innerHTML = '';  // Clear previous link
 
                     try {
                         const prompt = `Parse this statement into a city name and customer count. Respond ONLY as valid JSON: {"city": "CityName", "customers": number}. Statement: ${query}`;
@@ -118,11 +121,12 @@ if not india_cities.empty:
                         const customers = parseInt(parsed.customers);
 
                         if (city && customers > 0) {
-                            // Update the parent URL with query params to trigger Streamlit update
+                            // Create a link for user to click and add
                             const newUrl = new URL(window.parent.location.href);
                             newUrl.searchParams.set('city', city);
                             newUrl.searchParams.set('customers', customers);
-                            window.parent.location.href = newUrl.toString();
+                            addLinkContainer.innerHTML = `<a href="${newUrl.toString()}" target="_parent" style="color: #4CAF50; text-decoration: none; font-weight: bold;">Click to Add: ${customers} customers in ${city}</a>`;
+                            statusDiv.innerHTML = 'Query processed. Click the link above to add to the list.';
                         } else {
                             statusDiv.innerHTML = 'Could not parse response.';
                         }
