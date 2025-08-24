@@ -40,22 +40,6 @@ except Exception as e:
     cost_df = pd.DataFrame()
     avg_cost = 0
 
-# Load the airport dataset
-AIRPORT_PATH = "airports.csv"
-try:
-    airport_df = pd.read_csv(AIRPORT_PATH)
-    # Assuming columns: Airport Name,Latitude,Longitude
-    # Convert latitude/longitude if in string format (e.g., 18.60961723N to float 18.60961723)
-    def parse_coord(coord):
-        if isinstance(coord, str):
-            coord = coord.replace('N', '').replace('E', '').replace('S', '-').replace('W', '-')
-        return float(coord)
-    airport_df['Latitude'] = airport_df['Latitude'].apply(parse_coord)
-    airport_df['Longitude'] = airport_df['Longitude'].apply(parse_coord)
-except Exception as e:
-    st.error(f"Error loading airport CSV from {AIRPORT_PATH}: {e}")
-    airport_df = pd.DataFrame()
-
 # Initialize session state for customer data
 if 'customer_data' not in st.session_state:
     st.session_state.customer_data = []
@@ -66,17 +50,6 @@ def get_city_cost(city):
     if not match.empty:
         return match['cost_per_sqft'].values[0]
     return avg_cost
-
-# Function to get min distance to any airport for a given lat/lon
-def get_min_airport_distance(lat, lon):
-    if airport_df.empty:
-        return 1000  # Arbitrary large distance if no data
-    min_dist = float('inf')
-    for _, airport in airport_df.iterrows():
-        dist = geodesic((lat, lon), (airport['Latitude'], airport['Longitude'])).km
-        if dist < min_dist:
-            min_dist = dist
-    return min_dist
 
 # Function to update customer data from Gemini response
 def update_customer_from_gemini(city, customers):
@@ -207,12 +180,11 @@ if not india_cities.empty:
 else:
     st.warning("CSV file not loaded. Ensure 'india_cities.csv' is in the app directory.")
 
-# Sliders for impacts (0 = no impact, 1 = maximum impact)
+# Slider for cost impact (0 = no impact, 1 = maximum impact, strongly prefers low cost)
 cost_impact = st.slider("Cost Impact on Location Selection (higher = strongly prefer lower cost areas)", 0.0, 1.0, 0.5)
-airport_impact = st.slider("Airport Proximity Impact (higher = strongly prefer areas near airports)", 0.0, 1.0, 0.5)
 
-# Function to calculate weighted geographic centroid with cost and airport adjustments
-def weighted_geographic_centroid(customers_df, cost_impact, airport_impact):
+# Function to calculate weighted geographic centroid with amplified cost adjustment
+def weighted_geographic_centroid(customers_df, cost_impact):
     if customers_df.empty:
         return None, None
     
@@ -224,25 +196,14 @@ def weighted_geographic_centroid(customers_df, cost_impact, airport_impact):
     max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
     min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
 
-    # For airport: Precompute max/min possible distances (arbitrary, e.g., 1000km as max)
-    max_airport_dist = 1000  # km, adjust as needed
-    min_airport_dist = 0
-
     for _, row in customers_df.iterrows():
         city_cost = get_city_cost(row['city'])
         # Normalized cost (0 = lowest, 1 = highest)
         normalized_cost = (city_cost - min_cost) / (max_cost - min_cost + 1e-6)
-        # Amplified cost factor: exponentially penalize high costs
-        cost_factor = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Exponent amplifies
-
-        # Airport factor: normalized inverse distance to nearest airport (higher = closer, better)
-        airport_dist = get_min_airport_distance(row['lat'], row['lng'])
-        normalized_airport = (max_airport_dist - airport_dist) / (max_airport_dist - min_airport_dist + 1e-6)
-        airport_factor = normalized_airport ** (1 + airport_impact * 4)  # Exponent amplifies preference for close airports
-
-        # Combined factor
-        combined_factor = cost_factor * airport_factor
-        weight = row['customers'] * combined_factor
+        # Amplified cost factor: exponentially penalize high costs when impact is high
+        # When cost_impact=1, low cost gets full weight, high cost gets near 0
+        cost_factor = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Exponent amplifies impact (up to ~5x)
+        weight = row['customers'] * cost_factor
 
         lat_rad = math.radians(row['lat'])
         lon_rad = math.radians(row['lng'])
@@ -291,8 +252,8 @@ if sites_input.strip():
             else:
                 st.error(f"Invalid format in: {line}")
 
-# Scoring function for sites: combined distance + amplified cost + amplified airport proximity
-def compute_site_score(site_lat, site_lon, customers_df, cost_impact, airport_impact):
+# Scoring function for sites: combined distance + amplified cost
+def compute_site_score(site_lat, site_lon, customers_df, cost_impact):
     if customers_df.empty:
         return 0.0
     
@@ -312,21 +273,20 @@ def compute_site_score(site_lat, site_lon, customers_df, cost_impact, airport_im
     max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
     min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
     for _, row in customers_df.iterrows():
-        dist = geodesic((site_lat, site_lon), (row['lat'], row['lng'])).km + 1e-6
+        dist = geodesic((site_lat, site_lon), (row['lat'], row['lng'])).km + 1e-6  # Avoid division by zero
         city_cost = get_city_cost(row['city'])
         costs.append(city_cost)
-        cost_weights.append(row['customers'] / dist)
+        cost_weights.append(row['customers'] / dist)  # Weight by customers and proximity
+    
     weighted_avg_cost = np.average(costs, weights=cost_weights)
+    # Normalized cost (0 = low, 1 = high)
     normalized_cost = (weighted_avg_cost - min_cost) / (max_cost - min_cost + 1e-6)
-    cost_score = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Amplified
+    # Amplified cost score: exponentially favor low costs
+    cost_score = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Exponent amplifies (up to ~5x)
 
-    # Airport score: inverse of min distance to any airport, amplified
-    airport_dist = get_min_airport_distance(site_lat, site_lon)
-    normalized_airport = 1 / (1 + airport_dist / 100)  # Normalize (closer = higher)
-    airport_score = normalized_airport ** (1 + airport_impact * 4)  # Amplified
-
-    # Combined score (average of components, weighted by impacts)
-    final_score = distance_score * (1 - cost_impact - airport_impact) + cost_score * cost_impact + airport_score * airport_impact
+    # Combined score (normalize cost_score to prevent over-domination)
+    cost_score = min(max(cost_score, 0), 1)  # Clamp to [0,1]
+    final_score = distance_score * (1 - cost_impact) + cost_score * cost_impact
     return final_score
 
 # Calculate and find best site
@@ -335,7 +295,7 @@ if st.button("Calculate Ideal Location") and not india_cities.empty and not user
         best_site = None
         best_score = -np.inf
         for site in potential_sites:
-            score = compute_site_score(site['lat'], site['lon'], user_customers_df, cost_impact, airport_impact)
+            score = compute_site_score(site['lat'], site['lon'], user_customers_df, cost_impact)
             site['score'] = score
             if score > best_score:
                 best_score = score
@@ -343,17 +303,17 @@ if st.button("Calculate Ideal Location") and not india_cities.empty and not user
         
         st.success(f"Ideal location among provided sites: {best_site['name']} at ({best_site['lat']:.4f}, {best_site['lon']:.4f}) with score {best_score:.4f}")
         
-        centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df, cost_impact, airport_impact)
+        centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df, cost_impact)
         if centroid_lat is not None:
-            centroid_score = compute_site_score(centroid_lat, centroid_lon, user_customers_df, cost_impact, airport_impact)
+            centroid_score = compute_site_score(centroid_lat, centroid_lon, user_customers_df, cost_impact)
             st.info(f"For comparison, weighted centroid location: ({centroid_lat:.4f}, {centroid_lon:.4f}) with score {centroid_score:.4f}")
         
         map_center = [best_site['lat'], best_site['lon']]
     else:
-        centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df, cost_impact, airport_impact)
+        centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df, cost_impact)
         if centroid_lat is not None:
-            centroid_score = compute_site_score(centroid_lat, centroid_lon, user_customers_df, cost_impact, airport_impact)
-            st.success(f"Computed ideal location (cost & airport-adjusted weighted centroid): ({centroid_lat:.4f}, {centroid_lon:.4f}) with score {centroid_score:.4f}")
+            centroid_score = compute_site_score(centroid_lat, centroid_lon, user_customers_df, cost_impact)
+            st.success(f"Computed ideal location (cost-adjusted weighted centroid): ({centroid_lat:.4f}, {centroid_lon:.4f}) with score {centroid_score:.4f}")
             map_center = [centroid_lat, centroid_lon]
         else:
             st.error("Unable to compute centroid - no customer data with weights.")
@@ -385,14 +345,6 @@ if st.button("Calculate Ideal Location") and not india_cities.empty and not user
             location=[centroid_lat, centroid_lon],
             popup="Weighted Centroid",
             icon=folium.Icon(color='green', icon='star')
-        ).add_to(m)
-    
-    # Optionally add airport markers for visualization
-    for _, airport in airport_df.iterrows():
-        folium.Marker(
-            location=[airport['Latitude'], airport['Longitude']],
-            popup=airport['Airport Name'],
-            icon=folium.Icon(color='orange', icon='plane')
         ).add_to(m)
     
     map_html = m._repr_html_()
