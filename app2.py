@@ -53,16 +53,6 @@ def update_customer_from_parsed(city, customers):
     else:
         st.warning(f"City '{city}' not found in the dataset.")
 
-# Check query params for updates from WebGPU
-query_params = st.query_params.to_dict()
-if 'city' in query_params and 'customers' in query_params:
-    city = query_params['city'][0]
-    customers = int(query_params['customers'][0])
-    update_customer_from_parsed(city, customers)
-    # Clear the query params to avoid re-adding on refresh
-    st.query_params.clear()
-    st.rerun()  # Rerun to refresh the display
-
 if not india_cities.empty:
     st.subheader("Step 1: Specify Customer Distribution via Natural Language or Manual Selection")
     
@@ -112,22 +102,18 @@ if not india_cities.empty:
                         });
                         const aiResponse = response.choices[0].message.content.trim();
 
-                        // Parse the JSON response
+                        // Automatically parse and send via postMessage
                         const parsed = JSON.parse(aiResponse);
                         const city = parsed.city;
                         const customers = parseInt(parsed.customers);
-
                         if (city && customers > 0) {
-                            // Update the parent URL with query params to trigger Streamlit update
-                            const newUrl = new URL(window.parent.location.href);
-                            newUrl.searchParams.set('city', city);
-                            newUrl.searchParams.set('customers', customers);
-                            window.parent.location.href = newUrl.toString();
+                            parent.postMessage({ type: 'update_customer', city: city, customers: customers }, '*');
+                            statusDiv.innerHTML = `Processed: ${customers} customers in ${city}. Updating automatically...`;
                         } else {
-                            statusDiv.innerHTML = 'Could not parse response.';
+                            statusDiv.innerHTML = 'Could not parse response. Use manual addition.';
                         }
                     } catch (error) {
-                        statusDiv.innerHTML = `Error: ${error.message}`;
+                        statusDiv.innerHTML = `Error: ${error.message}. Use manual addition.`;
                     }
                 });
             } catch (error) {
@@ -136,6 +122,39 @@ if not india_cities.empty:
         })();
     </script>
     """, height=200)
+
+    # JavaScript listener for postMessage to update session state (run in another html to listen)
+    html("""
+    <script>
+        window.addEventListener('message', function(event) {
+            if (event.data.type === 'update_customer') {
+                // Here, we can try to update a hidden input or localStorage
+                localStorage.setItem('ai_city', event.data.city);
+                localStorage.setItem('ai_customers', event.data.customers);
+                // Trigger a rerun by simulating interaction if possible, but in Streamlit, we need Python to poll
+            }
+        });
+    </script>
+    """, height=1)
+
+    # Poll localStorage in Python via JS (use st.javascript to read)
+    ai_city = st.experimental_get_query_params().get('ai_city', [None])[0]  # Not direct
+    # To read localStorage, use a hidden html with script that posts to a div
+    # For simplicity, add a button to fetch from localStorage
+    if st.button("Update from AI Processing"):
+        # Use JS to get localStorage and display
+        ai_city_js = st.javascript("localStorage.getItem('ai_city')")
+        ai_customers_js = st.javascript("localStorage.getItem('ai_customers')")
+        if ai_city_js and ai_customers_js:
+            try:
+                customers = int(ai_customers_js)
+                update_customer_from_parsed(ai_city_js, customers)
+                st.success(f"Added/Updated from AI: {customers} customers in {ai_city_js}")
+                st.rerun()
+            except ValueError:
+                st.error("Invalid data from AI.")
+        else:
+            st.info("No AI data available. Process a query first.")
 
     # Manual selection
     city_options = (india_cities['city'] + ", " + india_cities['state_name']).tolist()
