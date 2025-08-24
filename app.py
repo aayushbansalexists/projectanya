@@ -5,6 +5,9 @@ import numpy as np
 from geopy.distance import geodesic
 from streamlit.components.v1 import html
 import math
+import requests
+import json
+import re
 
 st.title("Factory Site Selection with Custom Customer Distribution - India Edition")
 
@@ -31,8 +34,8 @@ except Exception as e:
 if 'customer_data' not in st.session_state:
     st.session_state.customer_data = []
 
-# Function to update customer data from parsed response
-def update_customer_from_parsed(city, customers):
+# Function to update customer data from Gemini response
+def update_customer_from_gemini(city, customers):
     # Find the city in the dataset (case-insensitive match)
     match = india_cities[india_cities['city'].str.lower() == city.lower()]
     if not match.empty:
@@ -53,95 +56,63 @@ def update_customer_from_parsed(city, customers):
     else:
         st.warning(f"City '{city}' not found in the dataset.")
 
-# Check query params for AI updates
-query_params = st.query_params.to_dict()
-if 'city' in query_params and 'customers' in query_params:
-    city = query_params['city'][0]
-    customers = int(query_params['customers'][0])
-    update_customer_from_parsed(city, customers)
-    # Clear the query params to avoid re-adding
-    st.query_params.clear()
-    st.rerun()  # Rerun to refresh the display
-
 if not india_cities.empty:
     st.subheader("Step 1: Specify Customer Distribution via Natural Language or Manual Selection")
     
-    # Embed JavaScript for WebGPU-based model inference
-    html("""
-    <div id="webgpu-container">
-        <input id="user-query" type="text" placeholder="Tell me about your customers (e.g., 'I have 20000 customers in Mumbai')" style="width: 100%; padding: 10px; margin-bottom: 10px;">
-        <button id="process-query" style="padding: 10px; background-color: #4CAF50; color: white; border: none; cursor: pointer;">Process Query with WebGPU</button>
-        <div id="status" style="margin-top: 10px;"></div>
-        <div id="add-link-container" style="margin-top: 10px;"></div>
-    </div>
-    <script type="text/javascript">
-        (async () => {
-            const userQueryInput = document.getElementById('user-query');
-            const processButton = document.getElementById('process-query');
-            const statusDiv = document.getElementById('status');
-            const addLinkContainer = document.getElementById('add-link-container');
-
-            // Check for WebGPU support
-            if (!navigator.gpu) {
-                statusDiv.innerHTML = 'WebGPU is not supported in this browser. Please use manual selection below.';
-                return;
-            }
-
-            statusDiv.innerHTML = 'Initializing WebGPU model...';
-
-            try {
-                const { CreateMLCEngine } = await import('https://esm.run/@mlc-ai/web-llm');
-                const engine = await CreateMLCEngine('Llama-3.2-1B-Instruct-q4f16_1-MLC', {
-                    initProgressCallback: (report) => {
-                        statusDiv.innerHTML = `${report.text} (${Math.round(report.progress * 100)}%)`;
-                    }
-                });
-
-                statusDiv.innerHTML = 'Model loaded. Ready for queries.';
-
-                processButton.addEventListener('click', async () => {
-                    const query = userQueryInput.value.trim();
-                    if (!query) return;
-
-                    statusDiv.innerHTML = 'Processing query...';
-                    addLinkContainer.innerHTML = '';  // Clear previous link
-
-                    try {
-                        const prompt = `Parse this statement into a city name and customer count. Respond ONLY as valid JSON: {"city": "CityName", "customers": number}. Statement: ${query}`;
-                        const response = await engine.chat.completions.create({
-                            messages: [{ role: 'user', content: prompt }],
-                            temperature: 0.7,
-                            max_tokens: 100
-                        });
-                        const aiResponse = response.choices[0].message.content.trim();
-
-                        // Parse the JSON response
-                        const parsed = JSON.parse(aiResponse);
-                        const city = parsed.city;
-                        const customers = parseInt(parsed.customers);
-
-                        if (city && customers > 0) {
-                            // Create a link for user to click and add
-                            const newUrl = new URL(window.parent.location.href);
-                            newUrl.searchParams.set('city', city);
-                            newUrl.searchParams.set('customers', customers);
-                            addLinkContainer.innerHTML = `<a href="${newUrl.toString()}" target="_parent" style="color: #4CAF50; text-decoration: none; font-weight: bold;">Click to Add: ${customers} customers in ${city}</a>`;
-                            statusDiv.innerHTML = 'Query processed. Click the link above to add to the list.';
-                        } else {
-                            statusDiv.innerHTML = 'Could not parse response.';
-                        }
-                    } catch (error) {
-                        statusDiv.innerHTML = `Error: ${error.message}`;
-                    }
-                });
-            } catch (error) {
-                statusDiv.innerHTML = `Failed to load model: ${error.message}. Use manual selection.`;
-            }
-        })();
-    </script>
-    """, height=200)
-
-    # Manual selection
+    # Natural language input box for Gemini integration
+    user_query = st.text_input("Tell me about your customers (e.g., 'I have 20000 customers in Mumbai')", "")
+    if st.button("Process Query with Gemini") and user_query:
+        gemini_api_key = st.secrets.get("GEMINI_API_KEY")
+        if not gemini_api_key:
+            st.error("GEMINI_API_KEY not set in Streamlit secrets. Add it in your app's settings on Streamlit Cloud.")
+        else:
+            try:
+                # Query Gemini API
+                gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+                headers = {
+                    "Content-Type": "application/json"
+                }
+                data = {
+                    "contents": [{
+                        "parts": [{
+                            "text": f"Parse this statement into a city name and customer count. Respond ONLY as valid JSON without any additional text, code blocks, or explanations: {{\"city\": \"CityName\", \"customers\": number}}. Do not include anything else. Statement: {user_query}"
+                        }]
+                    }]
+                }
+                response = requests.post(f"{gemini_url}?key={gemini_api_key}", headers=headers, json=data)
+                if response.status_code == 200 and response.text:
+                    gemini_result = response.json()
+                    # Extract the generated text
+                    ollama_response = gemini_result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
+                    if ollama_response:
+                        # Extract the first well-formed { ... } block using regex
+                        json_match = re.search(r'\{.*?\}', ollama_response, re.DOTALL)
+                        if json_match:
+                            json_str = json_match.group(0)
+                            # Clean the extracted JSON: Remove extra garbage, replace single quotes
+                            json_str = re.sub(r'``````|undefined|json|\s+', '', json_str).strip()
+                            json_str = re.sub(r"'(?P<key>[^':]+)':", r'\"\g<key>\":', json_str)  # Replace single-quoted keys
+                            json_str = json_str.replace("'", '"')  # Replace single-quoted values
+                            parsed = json.loads(json_str)
+                            city = parsed.get('city')
+                            customers = int(parsed.get('customers', 0))
+                            if city and customers > 0:
+                                update_customer_from_gemini(city, customers)
+                                st.success(f"Updated: {customers} customers in {city}")
+                            else:
+                                st.error("Could not parse city or customer count from response.")
+                        else:
+                            st.error("No valid JSON block found in response.")
+                    else:
+                        st.error("Gemini returned an empty response.")
+                else:
+                    st.error(f"Gemini server error: {response.status_code} - {response.text}")
+            except json.JSONDecodeError as json_err:
+                st.error(f"JSON parsing error: {json_err}. Raw response: {ollama_response}")
+            except Exception as e:
+                st.error(f"Error processing query: {e}")
+    
+    # Manual selection (as before, for fallback or additional edits)
     city_options = (india_cities['city'] + ", " + india_cities['state_name']).tolist()
     selected_cities = st.multiselect(
         "Manually select/add cities and edit counts below",
@@ -149,7 +120,7 @@ if not india_cities.empty:
         help="Use this to manually adjust or add more."
     )
     
-    # Display and edit customer data
+    # Display and edit customer data (combines Gemini updates and manual)
     st.subheader("Current Customer Distribution")
     edited_data = []
     for data in st.session_state.customer_data:
@@ -265,8 +236,7 @@ def compute_customer_proximity_score(site_lat, site_lon, customers_df):
     return 1 / (1 + weighted_avg_dist / 1000)
 
 # Calculate and find best site
-if st.button("Calculate Ideal Location") and not india_cities.empty and len(st.session_state.customer_data) > 0:
-    user_customers_df = pd.DataFrame(st.session_state.customer_data)
+if st.button("Calculate Ideal Location") and not india_cities.empty and not user_customers_df.empty:
     if potential_sites:
         best_site = None
         best_score = -np.inf
