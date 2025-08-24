@@ -11,21 +11,26 @@ import re
 
 st.title("Factory Site Selection with Custom Customer Distribution - India Edition")
 
+# Hardcoded path to the CSV file
 CSV_PATH = "india_cities.csv"
 
+# Load the India cities dataset from the hardcoded CSV path
 try:
     india_cities = pd.read_csv(CSV_PATH)
+    # Select and rename relevant columns based on the provided CSV structure
     india_cities = india_cities[['city', 'state', 'population', 'latitude', 'longitude']]
     india_cities = india_cities.rename(columns={
         'state': 'state_name',
         'latitude': 'lat',
         'longitude': 'lng'
     })
+    # Filter by population threshold (e.g., >= 50,000 for relevance)
     india_cities = india_cities[india_cities['population'] >= 50000].reset_index(drop=True)
 except Exception as e:
     st.error(f"Error loading CSV from {CSV_PATH}: {e}")
     india_cities = pd.DataFrame()
 
+# Load the cost dataset
 COST_PATH = "cities_cleaned.csv"
 try:
     cost_df = pd.read_csv(COST_PATH)
@@ -35,9 +40,12 @@ except Exception as e:
     cost_df = pd.DataFrame()
     avg_cost = 0
 
+# Load the airport dataset
 AIRPORT_PATH = "airports.csv"
 try:
     airport_df = pd.read_csv(AIRPORT_PATH)
+    # Assuming columns: Airport Name,Latitude,Longitude
+    # Convert latitude/longitude if in string format (e.g., 18.60961723N to float 18.60961723)
     def parse_coord(coord):
         if isinstance(coord, str):
             coord = coord.replace('N', '').replace('E', '').replace('S', '-').replace('W', '-')
@@ -48,18 +56,21 @@ except Exception as e:
     st.error(f"Error loading airport CSV from {AIRPORT_PATH}: {e}")
     airport_df = pd.DataFrame()
 
+# Initialize session state for customer data
 if 'customer_data' not in st.session_state:
     st.session_state.customer_data = []
 
+# Function to get cost for a city, fallback to average
 def get_city_cost(city):
     match = cost_df[cost_df['city'].str.lower() == city.lower()]
     if not match.empty:
         return match['cost_per_sqft'].values[0]
     return avg_cost
 
+# Function to get min distance to any airport for a given lat/lon
 def get_min_airport_distance(lat, lon):
     if airport_df.empty:
-        return 1000  
+        return 1000  # Arbitrary large distance if no data
     min_dist = float('inf')
     for _, airport in airport_df.iterrows():
         dist = geodesic((lat, lon), (airport['Latitude'], airport['Longitude'])).km
@@ -67,14 +78,18 @@ def get_min_airport_distance(lat, lon):
             min_dist = dist
     return min_dist
 
+# Function to update customer data from Gemini response
 def update_customer_from_gemini(city, customers):
+    # Find the city in the dataset (case-insensitive match)
     match = india_cities[india_cities['city'].str.lower() == city.lower()]
     if not match.empty:
         row = match.iloc[0]
+        # Check if city already exists in customer_data
         for data in st.session_state.customer_data:
             if data['city'].lower() == city.lower():
-                data['customers'] = customers  
+                data['customers'] = customers  # Update existing
                 return
+        # Add new if not found
         st.session_state.customer_data.append({
             'city': row['city'],
             'state_name': row['state_name'],
@@ -88,6 +103,7 @@ def update_customer_from_gemini(city, customers):
 if not india_cities.empty:
     st.subheader("Step 1: Specify Customer Distribution via Natural Language or Manual Selection")
     
+    # Natural language input box for Gemini integration
     user_query = st.text_input("Tell me about your customers (e.g., 'I have 20000 customers in Mumbai')", "")
     if st.button("Process Query with Gemini") and user_query:
         gemini_api_key = st.secrets.get("GEMINI_API_KEY")
@@ -95,6 +111,7 @@ if not india_cities.empty:
             st.error("GEMINI_API_KEY not set in Streamlit secrets. Add it in your app's settings on Streamlit Cloud.")
         else:
             try:
+                # Query Gemini API
                 gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
                 headers = {
                     "Content-Type": "application/json"
@@ -109,14 +126,17 @@ if not india_cities.empty:
                 response = requests.post(f"{gemini_url}?key={gemini_api_key}", headers=headers, json=data)
                 if response.status_code == 200 and response.text:
                     gemini_result = response.json()
+                    # Extract the generated text
                     gemini_response = gemini_result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '').strip()
                     if gemini_response:
+                        # Extract the first well-formed { ... } block using regex
                         json_match = re.search(r'\{.*?\}', gemini_response, re.DOTALL)
                         if json_match:
                             json_str = json_match.group(0)
+                            # Clean the extracted JSON: Remove extra garbage, replace single quotes
                             json_str = re.sub(r'``````|undefined|json|\s+', '', json_str).strip()
-                            json_str = re.sub(r"'(?P<key>[^':]+)':", r'\"\g<key>\":', json_str)  
-                            json_str = json_str.replace("'", '"')  
+                            json_str = re.sub(r"'(?P<key>[^':]+)':", r'\"\g<key>\":', json_str)  # Replace single-quoted keys
+                            json_str = json_str.replace("'", '"')  # Replace single-quoted values
                             parsed = json.loads(json_str)
                             city = parsed.get('city')
                             customers = int(parsed.get('customers', 0))
@@ -136,6 +156,7 @@ if not india_cities.empty:
             except Exception as e:
                 st.error(f"Error processing query: {e}")
     
+    # Manual selection (as before, for fallback or additional edits)
     city_options = (india_cities['city'] + ", " + india_cities['state_name']).tolist()
     selected_cities = st.multiselect(
         "Manually select/add cities and edit counts below",
@@ -143,6 +164,7 @@ if not india_cities.empty:
         help="Use this to manually adjust or add more."
     )
     
+    # Display and edit customer data (combines Gemini updates and manual)
     st.subheader("Current Customer Distribution")
     edited_data = []
     for data in st.session_state.customer_data:
@@ -157,6 +179,7 @@ if not india_cities.empty:
         if count > 0:
             edited_data.append(data)
     
+    # Add any new manual selections
     for city_state in selected_cities:
         city, state = [x.strip() for x in city_state.split(",")]
         if not any(d['city'] == city for d in edited_data):
@@ -184,9 +207,11 @@ if not india_cities.empty:
 else:
     st.warning("CSV file not loaded. Ensure 'india_cities.csv' is in the app directory.")
 
+# Sliders for impacts (0 = no impact, 1 = maximum impact)
 cost_impact = st.slider("Cost Impact on Location Selection (higher = strongly prefer lower cost areas)", 0.0, 1.0, 0.5)
 airport_impact = st.slider("Airport Proximity Impact (higher = strongly prefer areas near airports)", 0.0, 1.0, 0.5)
 
+# Function to calculate weighted geographic centroid with cost and airport adjustments
 def weighted_geographic_centroid(customers_df, cost_impact, airport_impact):
     if customers_df.empty:
         return None, None
@@ -199,18 +224,23 @@ def weighted_geographic_centroid(customers_df, cost_impact, airport_impact):
     max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
     min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
 
-    max_airport_dist = 1000  
+    # For airport: Precompute max/min possible distances (arbitrary, e.g., 1000km as max)
+    max_airport_dist = 1000  # km, adjust as needed
     min_airport_dist = 0
 
     for _, row in customers_df.iterrows():
         city_cost = get_city_cost(row['city'])
+        # Normalized cost (0 = lowest, 1 = highest)
         normalized_cost = (city_cost - min_cost) / (max_cost - min_cost + 1e-6)
-        cost_factor = (1 - normalized_cost) ** (1 + cost_impact * 4)  
+        # Amplified cost factor: exponentially penalize high costs
+        cost_factor = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Exponent amplifies
 
+        # Airport factor: normalized inverse distance to nearest airport (higher = closer, better)
         airport_dist = get_min_airport_distance(row['lat'], row['lng'])
         normalized_airport = (max_airport_dist - airport_dist) / (max_airport_dist - min_airport_dist + 1e-6)
-        airport_factor = normalized_airport ** (1 + airport_impact * 4)  
+        airport_factor = normalized_airport ** (1 + airport_impact * 4)  # Exponent amplifies preference for close airports
 
+        # Combined factor
         combined_factor = cost_factor * airport_factor
         weight = row['customers'] * combined_factor
 
@@ -235,6 +265,7 @@ def weighted_geographic_centroid(customers_df, cost_impact, airport_impact):
 
     return math.degrees(lat), math.degrees(lon)
 
+# Input for potential factory sites
 st.subheader("Step 2: Input Potential Factory Sites (Optional)")
 sites_input = st.text_area(
     "Enter sites (one per line as: name,lat,lon). Leave empty to compute optimal location via weighted centroid.",
@@ -260,10 +291,12 @@ if sites_input.strip():
             else:
                 st.error(f"Invalid format in: {line}")
 
+# Scoring function for sites: combined distance + amplified cost + amplified airport proximity
 def compute_site_score(site_lat, site_lon, customers_df, cost_impact, airport_impact):
     if customers_df.empty:
         return 0.0
     
+    # Distance score
     dists = []
     weights = []
     for _, row in customers_df.iterrows():
@@ -271,8 +304,9 @@ def compute_site_score(site_lat, site_lon, customers_df, cost_impact, airport_im
         dists.append(dist)
         weights.append(row['customers'])
     weighted_avg_dist = np.average(dists, weights=weights)
-    distance_score = 1 / (1 + weighted_avg_dist / 1000)  
+    distance_score = 1 / (1 + weighted_avg_dist / 1000)  # Higher better (closer)
 
+    # Cost score: average cost weighted by inverse distance, amplified
     costs = []
     cost_weights = []
     max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
@@ -284,15 +318,18 @@ def compute_site_score(site_lat, site_lon, customers_df, cost_impact, airport_im
         cost_weights.append(row['customers'] / dist)
     weighted_avg_cost = np.average(costs, weights=cost_weights)
     normalized_cost = (weighted_avg_cost - min_cost) / (max_cost - min_cost + 1e-6)
-    cost_score = (1 - normalized_cost) ** (1 + cost_impact * 4)  
+    cost_score = (1 - normalized_cost) ** (1 + cost_impact * 4)  # Amplified
 
+    # Airport score: inverse of min distance to any airport, amplified
     airport_dist = get_min_airport_distance(site_lat, site_lon)
-    normalized_airport = 1 / (1 + airport_dist / 100)  
-    airport_score = normalized_airport ** (1 + airport_impact * 4)  
+    normalized_airport = 1 / (1 + airport_dist / 100)  # Normalize (closer = higher)
+    airport_score = normalized_airport ** (1 + airport_impact * 4)  # Amplified
 
+    # Combined score (average of components, weighted by impacts)
     final_score = distance_score * (1 - cost_impact - airport_impact) + cost_score * cost_impact + airport_score * airport_impact
     return final_score
 
+# Calculate and find best site
 if st.button("Calculate Ideal Location") and not india_cities.empty and not user_customers_df.empty:
     if potential_sites:
         best_site = None
@@ -350,14 +387,12 @@ if st.button("Calculate Ideal Location") and not india_cities.empty and not user
             icon=folium.Icon(color='green', icon='star')
         ).add_to(m)
     
+    # Optionally add airport markers for visualization
     for _, airport in airport_df.iterrows():
-        folium.CircleMarker(
+        folium.Marker(
             location=[airport['Latitude'], airport['Longitude']],
-            radius=3,  
-            color='orange',
-            fill=True,
-            fill_opacity=0.7,
-            popup=airport['Airport Name']
+            popup=airport['Airport Name'],
+            icon=folium.Icon(color='orange', icon='plane')
         ).add_to(m)
     
     map_html = m._repr_html_()
