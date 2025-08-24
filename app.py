@@ -11,72 +11,58 @@ import re
 
 st.title("Factory Site Selection with Custom Customer Distribution - India Edition")
 
-# Hardcoded path to the main cities CSV file
+# Hardcoded path to the CSV file
 CSV_PATH = "india_cities.csv"
 
-# Hardcoded path to the cost CSV file
-COST_CSV_PATH = "cities_cleaned.csv"
-
-# Load the main India cities dataset
+# Load the India cities dataset from the hardcoded CSV path
 try:
     india_cities = pd.read_csv(CSV_PATH)
+    # Select and rename relevant columns based on the provided CSV structure
     india_cities = india_cities[['city', 'state', 'population', 'latitude', 'longitude']]
     india_cities = india_cities.rename(columns={
         'state': 'state_name',
         'latitude': 'lat',
         'longitude': 'lng'
     })
+    # Filter by population threshold (e.g., >= 50,000 for relevance)
     india_cities = india_cities[india_cities['population'] >= 50000].reset_index(drop=True)
 except Exception as e:
-    st.error(f"Error loading main CSV from {CSV_PATH}: {e}")
+    st.error(f"Error loading CSV from {CSV_PATH}: {e}")
     india_cities = pd.DataFrame()
 
 # Load the cost dataset
+COST_PATH = "cities_cleaned.csv"
 try:
-    cost_df = pd.read_csv(COST_CSV_PATH)
-    cost_df = cost_df[['city', 'cost_per_sqft', 'latitude', 'longitude']]
-    cost_df = cost_df.rename(columns={'latitude': 'lat', 'longitude': 'lng'})
-    # Calculate average cost for missing values
-    average_cost = cost_df['cost_per_sqft'].mean()
-    max_cost = cost_df['cost_per_sqft'].max()
-    # Create a map for quick lookup (city to cost)
-    cost_map = cost_df.set_index('city')['cost_per_sqft'].to_dict()
-    # Also create a list of cost cities with lat/lon for nearest lookup
-    cost_locations = cost_df[['city', 'lat', 'lng']].to_dict('records')
+    cost_df = pd.read_csv(COST_PATH)
+    avg_cost = cost_df['cost_per_sqft'].mean()
 except Exception as e:
-    st.error(f"Error loading cost CSV from {COST_CSV_PATH}: {e}")
+    st.error(f"Error loading cost CSV from {COST_PATH}: {e}")
     cost_df = pd.DataFrame()
-    average_cost = 0
-    max_cost = 1
-    cost_map = {}
-    cost_locations = []
+    avg_cost = 0
 
 # Initialize session state for customer data
 if 'customer_data' not in st.session_state:
     st.session_state.customer_data = []
 
-# Function to find cost for a given lat/lon (nearest city in cost dataset, or average if not found)
-def get_site_cost(site_lat, site_lon):
-    if not cost_locations:
-        return average_cost
-    min_dist = float('inf')
-    nearest_cost = average_cost
-    for loc in cost_locations:
-        dist = geodesic((site_lat, site_lon), (loc['lat'], loc['lng'])).km
-        if dist < min_dist:
-            min_dist = dist
-            nearest_cost = cost_map.get(loc['city'], average_cost)
-    return nearest_cost
+# Function to get cost for a city, fallback to average
+def get_city_cost(city):
+    match = cost_df[cost_df['city'].str.lower() == city.lower()]
+    if not match.empty:
+        return match['cost_per_sqft'].values[0]
+    return avg_cost
 
 # Function to update customer data from Gemini response
 def update_customer_from_gemini(city, customers):
+    # Find the city in the dataset (case-insensitive match)
     match = india_cities[india_cities['city'].str.lower() == city.lower()]
     if not match.empty:
         row = match.iloc[0]
+        # Check if city already exists in customer_data
         for data in st.session_state.customer_data:
             if data['city'].lower() == city.lower():
-                data['customers'] = customers
+                data['customers'] = customers  # Update existing
                 return
+        # Add new if not found
         st.session_state.customer_data.append({
             'city': row['city'],
             'state_name': row['state_name'],
@@ -143,7 +129,7 @@ if not india_cities.empty:
             except Exception as e:
                 st.error(f"Error processing query: {e}")
     
-    # Manual selection
+    # Manual selection (as before, for fallback or additional edits)
     city_options = (india_cities['city'] + ", " + india_cities['state_name']).tolist()
     selected_cities = st.multiselect(
         "Manually select/add cities and edit counts below",
@@ -151,7 +137,7 @@ if not india_cities.empty:
         help="Use this to manually adjust or add more."
     )
     
-    # Display and edit customer data
+    # Display and edit customer data (combines Gemini updates and manual)
     st.subheader("Current Customer Distribution")
     edited_data = []
     for data in st.session_state.customer_data:
@@ -194,15 +180,11 @@ if not india_cities.empty:
 else:
     st.warning("CSV file not loaded. Ensure 'india_cities.csv' is in the app directory.")
 
-# Slider for cost impact weight
-cost_impact_weight = st.slider(
-    "Impact of Cost per Sqft on Selection (0: none, 1: full)",
-    0.0, 1.0, 0.5,
-    help="Higher values prioritize lower cost locations more."
-)
+# Slider for cost impact (0 = no impact, 1 = high impact, prefers low cost)
+cost_impact = st.slider("Cost Impact on Location Selection (higher = prefer lower cost areas)", 0.0, 1.0, 0.5)
 
-# Function to calculate weighted geographic centroid
-def weighted_geographic_centroid(customers_df):
+# Function to calculate weighted geographic centroid with cost adjustment
+def weighted_geographic_centroid(customers_df, cost_impact):
     if customers_df.empty:
         return None, None
     
@@ -211,10 +193,17 @@ def weighted_geographic_centroid(customers_df):
     z = 0
     total_weight = 0
 
+    max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
+    min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
+
     for _, row in customers_df.iterrows():
+        city_cost = get_city_cost(row['city'])
+        # Adjust weight: higher impact makes low cost increase weight
+        cost_factor = 1 - cost_impact * ((city_cost - min_cost) / (max_cost - min_cost + 1e-6))  # 1 for low cost, lower for high cost
+        weight = row['customers'] * cost_factor
+
         lat_rad = math.radians(row['lat'])
         lon_rad = math.radians(row['lng'])
-        weight = row['customers']
 
         x += weight * math.cos(lat_rad) * math.cos(lon_rad)
         y += weight * math.cos(lat_rad) * math.sin(lon_rad)
@@ -260,8 +249,8 @@ if sites_input.strip():
             else:
                 st.error(f"Invalid format in: {line}")
 
-# Scoring function incorporating cost
-def compute_score(site_lat, site_lon, customers_df):
+# Scoring function for sites: combined distance + cost
+def compute_site_score(site_lat, site_lon, customers_df, cost_impact):
     if customers_df.empty:
         return 0.0
     
@@ -273,42 +262,53 @@ def compute_score(site_lat, site_lon, customers_df):
         dists.append(dist)
         weights.append(row['customers'])
     weighted_avg_dist = np.average(dists, weights=weights)
-    distance_score = 1 / (1 + weighted_avg_dist / 1000)  # Higher for closer
+    distance_score = 1 / (1 + weighted_avg_dist / 1000)  # Higher better (closer)
+
+    # Cost score: average cost of nearest cities or something? Wait, sites don't have inherent cost; perhaps estimate based on nearest city cost
+    # For simplicity, calculate average cost weighted by inverse distance to customer cities
+    costs = []
+    cost_weights = []
+    for _, row in customers_df.iterrows():
+        dist = geodesic((site_lat, site_lon), (row['lat'], row['lng'])).km + 1e-6  # Avoid division by zero
+        city_cost = get_city_cost(row['city'])
+        costs.append(city_cost)
+        cost_weights.append(row['customers'] / dist)  # Weight by customers and proximity
+    weighted_avg_cost = np.average(costs, weights=cost_weights)
     
-    # Cost score: Get cost for this site (nearest in cost dataset)
-    site_cost = get_site_cost(site_lat, site_lon)
-    cost_score = 1 - (site_cost / max_cost) if max_cost > 0 else 0  # Higher for lower cost
-    
+    # Normalize cost score (lower cost better)
+    max_cost = cost_df['cost_per_sqft'].max() if not cost_df.empty else 1
+    min_cost = cost_df['cost_per_sqft'].min() if not cost_df.empty else 0
+    cost_score = 1 - (weighted_avg_cost - min_cost) / (max_cost - min_cost + 1e-6)
+
     # Combined score
-    final_score = distance_score * (1 - cost_impact_weight) + cost_score * cost_impact_weight
+    final_score = distance_score * (1 - cost_impact) + cost_score * cost_impact
     return final_score
 
 # Calculate and find best site
 if st.button("Calculate Ideal Location") and not india_cities.empty and not user_customers_df.empty:
-    centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df)
-    centroid_score = None
-    if centroid_lat is not None:
-        centroid_score = compute_score(centroid_lat, centroid_lon, user_customers_df)
-    
     if potential_sites:
         best_site = None
         best_score = -np.inf
         for site in potential_sites:
-            score = compute_score(site['lat'], site['lon'], user_customers_df)
+            score = compute_site_score(site['lat'], site['lon'], user_customers_df, cost_impact)
             site['score'] = score
             if score > best_score:
                 best_score = score
                 best_site = site
         
-        st.success(f"Ideal location among provided sites: {best_site['name']} at ({best_site['lat']:.4f}, {best_site['lon']:.4f}) with score {best_score:.4f} (including cost impact)")
+        st.success(f"Ideal location among provided sites: {best_site['name']} at ({best_site['lat']:.4f}, {best_site['lon']:.4f}) with score {best_score:.4f}")
         
+        centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df, cost_impact)
         if centroid_lat is not None:
+            centroid_score = compute_site_score(centroid_lat, centroid_lon, user_customers_df, cost_impact)
             st.info(f"For comparison, weighted centroid location: ({centroid_lat:.4f}, {centroid_lon:.4f}) with score {centroid_score:.4f}")
         
         map_center = [best_site['lat'], best_site['lon']]
     else:
+        centroid_lat, centroid_lon = weighted_geographic_centroid(user_customers_df, cost_impact)
         if centroid_lat is not None:
-            st.success(f"Computed ideal location (weighted centroid): ({centroid_lat:.4f}, {centroid_lon:.4f}) with score {centroid_score:.4f} (including cost impact)")
+            centroid_score = compute_site_score(centroid_lat, centroid_lon, user_customers_df, cost_impact)
+            st.success(f"Computed ideal location (cost-adjusted weighted centroid): ({centroid_lat:.4f}, {centroid_lon:.4f}) with score {centroid_score:.4f}")
             map_center = [centroid_lat, centroid_lon]
         else:
             st.error("Unable to compute centroid - no customer data with weights.")
@@ -338,7 +338,7 @@ if st.button("Calculate Ideal Location") and not india_cities.empty and not user
     if centroid_lat is not None:
         folium.Marker(
             location=[centroid_lat, centroid_lon],
-            popup=f"Weighted Centroid: Score {centroid_score:.4f}",
+            popup="Weighted Centroid",
             icon=folium.Icon(color='green', icon='star')
         ).add_to(m)
     
